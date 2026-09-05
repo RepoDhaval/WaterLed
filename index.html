@@ -1,0 +1,875 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Blob Morph + Wave Sweep (Optimized)</title>
+<style>
+
+  /*
+    OPTIMIZATION NOTES (read me):
+    1. The old #led grid created 10,000 <div>s via JS. Replaced with a single
+       CSS repeating-linear-gradient — same visual, zero extra DOM nodes.
+    2. Each corner used to render TWO overlapping filtered blobs (phase-offset
+       "echo"). One copy per corner is deleted below — the remaining blob
+       already morphs through both shapes, so the visual loss is minimal but
+       it HALVES the SVG filter cost for those two corners.
+    3. feTurbulence numOctaves dropped 3->2 on every decorative (non-hero)
+       filter. Cheaper noise generation, same organic look at these sizes.
+    4. A "perf-lite" mode kicks in on small viewports AND on wide-but-weak
+       devices (low hardwareConcurrency/deviceMemory, e.g. budget tablets).
+       It hides the 4 morph-field shapes that get cropped off-screen on
+       narrow viewports anyway, cuts the 3-wave sweep down to 1, drops the
+       wave's turbulence filter (keeps the smooth path motion), and swaps
+       the expensive `mix-blend-mode: screen` for plain opacity.
+    5. Reduced-motion handling now also pauses perf-lite-hidden layers.
+  */
+
+  :root {
+    --corner-blob-lg: clamp(120px, 20vw, 260px);
+    --corner-blob-sm: clamp(96px, 17vw, 220px);
+    --corner-gap: clamp(12px, 4vw, 32px);
+  }
+
+  * { box-sizing: border-box; }
+
+  html, body {
+    margin: 0;
+    height: 100%;
+    min-height: 100dvh;
+    width: 100%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: linear-gradient(135deg, #2C5EAD, #1591DC);
+    position: relative;
+    overflow: hidden;
+  }
+
+  svg.main-blob {
+    width: min(60vw, 683px);
+    max-width: 90vw;
+    height: auto;
+  }
+
+  svg.corner-blob,
+  svg.corner-blob-left,
+  svg.corner-blob-bottom-right,
+  svg.corner-blob-bottom-left {
+    position: fixed;
+    width: var(--corner-blob-lg);
+    height: auto;
+    pointer-events: none;
+    contain: layout style paint;
+  }
+
+  svg.corner-blob {
+    top: var(--corner-gap);
+    right: var(--corner-gap);
+    transform: scale(1.4);
+    transform-origin: top right;
+  }
+
+  svg.corner-blob-left {
+    top: var(--corner-gap);
+    left: var(--corner-gap);
+    width: var(--corner-blob-sm);
+  }
+
+  svg.corner-blob-bottom-right {
+    bottom: var(--corner-gap);
+    right: var(--corner-gap);
+    width: var(--corner-blob-sm);
+  }
+
+  svg.corner-blob-bottom-left {
+    bottom: var(--corner-gap);
+    left: var(--corner-gap);
+    transform: scale(1.4);
+    transform-origin: bottom left;
+  }
+
+  /* Full-screen scattered morph layer — sits above corner blobs (z-index 5),
+     below the wave sweep (z-index 10). */
+  svg.morph-layer {
+    position: fixed;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    z-index: 5;
+    pointer-events: none;
+    contain: layout style paint;
+  }
+
+  /* Wave overlay sits above everything. Screen blend only on capable devices
+     (see .perf-lite override below) since it's costly to compose on weak GPUs. */
+  .wave-stage {
+    opacity: .7;
+    position: fixed;
+    inset: 0;
+    overflow: hidden;
+    z-index: 10;
+    pointer-events: none;
+    mix-blend-mode: screen;
+    contain: layout style paint;
+  }
+  svg.wave-svg {
+    width: 100%;
+    height: 100vh;
+    display: block;
+  }
+
+  /* Faint grid overlay — was 10,000 DOM nodes, now a single CSS pattern. */
+  #led {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    opacity: .05;
+    z-index: 100;
+    pointer-events: none;
+    background-image:
+      linear-gradient(to right, #333 1px, transparent 1px),
+      linear-gradient(to bottom, #333 1px, transparent 1px);
+    background-size: 1% 1%; /* mimics the old 100x100 desktop grid */
+  }
+
+  @media (max-width: 900px) {
+    :root {
+      --corner-blob-lg: clamp(90px, 16vw, 200px);
+      --corner-blob-sm: clamp(76px, 14vw, 170px);
+    }
+    svg.main-blob { width: 72vw; }
+    #led { background-size: 5% 2.5%; } /* mimics the old 20x40 mobile grid */
+  }
+
+  @media (max-width: 600px) {
+    :root {
+      --corner-blob-lg: clamp(64px, 24vw, 130px);
+      --corner-blob-sm: clamp(56px, 20vw, 110px);
+      --corner-gap: 10px;
+    }
+    svg.main-blob { width: 82vw; max-width: 420px; }
+  }
+
+  @media (max-width: 420px) {
+    svg.corner-blob,
+    svg.corner-blob-bottom-left {
+      display: none;
+    }
+  }
+
+  @media (max-height: 480px) {
+    svg.main-blob { width: 40vh; max-width: none; }
+    :root {
+      --corner-blob-lg: clamp(64px, 14vh, 130px);
+      --corner-blob-sm: clamp(56px, 12vh, 110px);
+    }
+  }
+
+  /* ---- perf-lite: applied by JS on small viewports OR weak hardware ---- */
+
+  /* Morph shapes near the edges of the 1705x1080 viewBox get cropped out by
+     `preserveAspectRatio="xMidYMid slice"` on narrow/tall viewports anyway —
+     hiding them here is a pure perf win with ~no visual change. */
+  body.perf-lite .morph-edge { display: none; }
+
+  /* Cut 3 concurrent wave sweeps down to 1. */
+  body.perf-lite .wave-b,
+  body.perf-lite .wave-c { display: none; }
+
+  /* Drop the wave's turbulence/displacement filter (CSS filter overrides the
+     SVG presentation attribute) — keeps the smooth path + fade motion,
+     removes the priciest part of the effect. Also swap the blend mode. */
+  body.perf-lite .wave-mover { filter: none !important; }
+  body.perf-lite .wave-stage { mix-blend-mode: normal; opacity: .35; }
+
+</style>
+</head>
+<body>
+
+<!-- Original centered blob (kept full quality — this is the hero element) -->
+<svg class="main-blob" viewBox="0 0 717 780" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <animate
+    attributeName="viewBox"
+    dur="6s"
+    repeatCount="indefinite"
+    values="
+      0 0 717 780;
+      0 0 683 747;
+      0 0 717 780"
+    keyTimes="0; 0.5; 1"
+    calcMode="spline"
+    keySplines="0.42 0 0.58 1; 0.42 0 0.58 1" />
+  <g filter="url(#filter0_g_1041_5)">
+    <path fill="#1591DC">
+      <animate
+        attributeName="d"
+        dur="6s"
+        repeatCount="indefinite"
+        calcMode="spline"
+        keySplines="0.42 0 0.58 1; 0.42 0 0.58 1"
+        keyTimes="0; 0.5; 1"
+        values="
+          M247.998 120.525C259.998 30.5249 121.498 82.5249 121.498 146.525C119.327 160.525 63.4978 365.025 73.4978 439.025C83.4978 513.025 109.498 667.525 171.998 697.525C234.498 727.525 227.998 685.525 265.998 635.525C303.998 585.525 512.498 587.525 602.498 493.025C692.498 398.525 610.498 333.025 590.498 331.025C570.498 329.025 516.498 395.025 412.498 439.025C309.195 482.73 278.41 449.478 229.001 396.109L227.998 395.025C177.998 341.025 235.998 210.525 247.998 120.525Z;
+          M231.198 103.725C243.198 13.7249 104.698 65.7249 104.698 129.725C102.527 143.725 46.698 348.225 56.698 422.225C66.698 496.225 92.698 650.725 155.198 680.725C217.698 710.725 211.198 668.725 249.198 618.725C287.198 568.725 495.698 570.725 585.698 476.225C675.698 381.725 593.698 316.225 573.698 314.225C553.698 312.225 499.698 378.225 395.698 422.225C292.396 465.93 261.61 432.677 212.201 379.309L211.198 378.225C161.198 324.225 219.198 193.725 231.198 103.725Z;
+          M247.998 120.525C259.998 30.5249 121.498 82.5249 121.498 146.525C119.327 160.525 63.4978 365.025 73.4978 439.025C83.4978 513.025 109.498 667.525 171.998 697.525C234.498 727.525 227.998 685.525 265.998 635.525C303.998 585.525 512.498 587.525 602.498 493.025C692.498 398.525 610.498 333.025 590.498 331.025C570.498 329.025 516.498 395.025 412.498 439.025C309.195 482.73 278.41 449.478 229.001 396.109L227.998 395.025C177.998 341.025 235.998 210.525 247.998 120.525Z"
+      />
+    </path>
+  </g>
+  <defs>
+    <filter id="filter0_g_1041_5" x="-0.000198364" y="4.57764e-05" width="716.145" height="779.878" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
+      <feFlood flood-opacity="0" result="BackgroundImageFix"/>
+      <feBlend mode="normal" in="SourceGraphic" in2="BackgroundImageFix" result="shape"/>
+      <feTurbulence type="fractalNoise" numOctaves="3" seed="6522" result="noise">
+        <animate
+          attributeName="baseFrequency"
+          dur="6s"
+          repeatCount="indefinite"
+          calcMode="spline"
+          keySplines="0.42 0 0.58 1; 0.42 0 0.58 1"
+          keyTimes="0; 0.5; 1"
+          values="
+            0.01727115735411644 0.01727115735411644;
+            0.013927576132118702 0.013927576132118702;
+            0.01727115735411644 0.01727115735411644" />
+      </feTurbulence>
+      <feDisplacementMap in="shape" in2="noise" xChannelSelector="R" yChannelSelector="G" result="displacedImage" width="100%" height="100%">
+        <animate
+          attributeName="scale"
+          dur="6s"
+          repeatCount="indefinite"
+          calcMode="spline"
+          keySplines="0.42 0 0.58 1; 0.42 0 0.58 1"
+          keyTimes="0; 0.5; 1"
+          values="144.60000610351562; 111; 144.60000610351562" />
+      </feDisplacementMap>
+      <feMerge result="effect1_texture_1041_5">
+        <feMergeNode in="displacedImage"/>
+      </feMerge>
+    </filter>
+  </defs>
+</svg>
+
+<!-- Top-right corner blob -->
+<svg class="corner-blob" viewBox="0 0 584 684" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <animate
+    attributeName="viewBox"
+    dur="6s"
+    repeatCount="indefinite"
+    values="
+      0 0 584 684;
+      0 0 490 609;
+      0 0 584 684"
+    keyTimes="0; 0.5; 1"
+    calcMode="spline"
+    keySplines="0.42 0 0.58 1; 0.42 0 0.58 1" />
+  <g filter="url(#filter0_g_1043_7)">
+    <path fill="#1591DC">
+      <animate
+        attributeName="d"
+        dur="6s"
+        repeatCount="indefinite"
+        calcMode="spline"
+        keySplines="0.42 0 0.58 1; 0.42 0 0.58 1"
+        keyTimes="0; 0.5; 1"
+        values="
+          M339.542 86.9999C263.942 127 171.708 165 135.042 179C100.542 192.717 51.0415 209 119.042 285.5C187.042 362 221.542 341.5 197.542 455.5C173.542 569.5 277.542 568 369.542 592C461.542 616 444.042 574 450.042 490C456.042 406 442.042 423.5 476.042 325.5C510.042 227.5 494.042 215 496.042 153C498.042 90.9999 434.042 36.9999 339.542 86.9999Z;
+          M292.941 58.1515C217.341 98.1515 125.108 136.152 88.4414 150.152C53.9414 163.868 4.44144 180.152 72.4414 256.652C140.441 333.152 174.941 312.652 150.941 426.652C126.941 540.652 230.941 539.152 322.941 563.152C414.941 587.152 397.441 545.152 403.441 461.152C409.441 377.152 395.441 394.652 429.441 296.652C463.441 198.652 447.441 186.152 449.441 124.152C451.441 62.1515 387.441 8.15154 292.941 58.1515Z;
+          M339.542 86.9999C263.942 127 171.708 165 135.042 179C100.542 192.717 51.0415 209 119.042 285.5C187.042 362 221.542 341.5 197.542 455.5C173.542 569.5 277.542 568 369.542 592C461.542 616 444.042 574 450.042 490C456.042 406 442.042 423.5 476.042 325.5C510.042 227.5 494.042 215 496.042 153C498.042 90.9999 434.042 36.9999 339.542 86.9999Z"
+      />
+    </path>
+  </g>
+  <defs>
+    <filter id="filter0_g_1043_7" x="9.91821e-05" y="-17.7516" width="583.191" height="701.549" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
+      <feFlood flood-opacity="0" result="BackgroundImageFix"/>
+      <feBlend mode="normal" in="SourceGraphic" in2="BackgroundImageFix" result="shape"/>
+      <feTurbulence type="fractalNoise" baseFrequency="0.017699114978313446 0.017699114978313446" numOctaves="2" seed="6899" result="noise"/>
+      <feDisplacementMap in="shape" in2="noise" xChannelSelector="R" yChannelSelector="G" result="displacedImage" width="100%" height="100%">
+        <animate
+          attributeName="scale"
+          dur="6s"
+          repeatCount="indefinite"
+          calcMode="spline"
+          keySplines="0.42 0 0.58 1; 0.42 0 0.58 1"
+          keyTimes="0; 0.5; 1"
+          values="170.19999694824219; 77; 170.19999694824219" />
+      </feDisplacementMap>
+      <feMerge result="effect1_texture_1043_7">
+        <feMergeNode in="displacedImage"/>
+      </feMerge>
+    </filter>
+  </defs>
+</svg>
+
+<!-- Top-left corner blob. (Previously two overlapping phase-offset copies —
+     one deleted. This single blob already morphs through both shapes, so
+     the "echo" is gone but the motion is unchanged, at half the filter cost.) -->
+<svg class="corner-blob-left" viewBox="0 0 524 519" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <animate
+    attributeName="viewBox"
+    dur="6s"
+    repeatCount="indefinite"
+    values="
+      0 0 524 519;
+      0 0 500 495;
+      0 0 524 519"
+    keyTimes="0; 0.5; 1"
+    calcMode="spline"
+    keySplines="0.42 0 0.58 1; 0.42 0 0.58 1" />
+  <g filter="url(#filter0_g_1043_8)">
+    <path fill="#1591DC">
+      <animate
+        attributeName="d"
+        dur="6s"
+        repeatCount="indefinite"
+        calcMode="spline"
+        keySplines="0.42 0 0.58 1; 0.42 0 0.58 1"
+        keyTimes="0; 0.5; 1"
+        values="
+          M379.313 274.077C377.713 233.677 423.98 181.244 447.313 160.077C461.313 92.0769 297.313 144.077 273.313 96.0768C249.313 48.0768 150.813 92.0769 98.8132 132.077C46.8132 172.077 90.8132 176.077 130.813 228.077C170.814 280.077 144.813 274.077 130.813 338.577C116.813 403.077 192.813 430.577 226.813 440.577C260.813 450.577 321.314 436.577 363.314 402.577C405.314 368.577 381.313 324.577 379.313 274.077Z;
+          M367.213 261.977C365.613 221.577 411.88 169.143 435.213 147.977C449.213 79.9768 285.213 131.977 261.213 83.9768C237.213 35.9768 138.713 79.9768 86.7131 119.977C34.7131 159.977 78.7131 163.977 118.713 215.977C158.714 267.977 132.713 261.977 118.713 326.477C104.713 390.977 180.713 418.477 214.713 428.477C248.713 438.477 309.213 424.477 351.213 390.477C393.213 356.477 369.213 312.477 367.213 261.977Z;
+          M379.313 274.077C377.713 233.677 423.98 181.244 447.313 160.077C461.313 92.0769 297.313 144.077 273.313 96.0768C249.313 48.0768 150.813 92.0769 98.8132 132.077C46.8132 172.077 90.8132 176.077 130.813 228.077C170.814 280.077 144.813 274.077 130.813 338.577C116.813 403.077 192.813 430.577 226.813 440.577C260.813 450.577 321.314 436.577 363.314 402.577C405.314 368.577 381.313 324.577 379.313 274.077Z"
+      />
+    </path>
+  </g>
+  <defs>
+    <filter id="filter0_g_1043_8" x="9.91821e-05" y="9.91821e-05" width="523.26" height="518.839" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
+      <feFlood flood-opacity="0" result="BackgroundImageFix"/>
+      <feBlend mode="normal" in="SourceGraphic" in2="BackgroundImageFix" result="shape"/>
+      <feTurbulence type="fractalNoise" numOctaves="2" seed="6446" result="noise">
+        <animate
+          attributeName="baseFrequency"
+          dur="6s"
+          repeatCount="indefinite"
+          calcMode="spline"
+          keySplines="0.42 0 0.58 1; 0.42 0 0.58 1"
+          keyTimes="0; 0.5; 1"
+          values="
+            0.011454753577709198 0.011454753577709198;
+            0.014492753893136978 0.014492753893136978;
+            0.011454753577709198 0.011454753577709198" />
+      </feTurbulence>
+      <feDisplacementMap in="shape" in2="noise" xChannelSelector="R" yChannelSelector="G" result="displacedImage" width="100%" height="100%">
+        <animate
+          attributeName="scale"
+          dur="6s"
+          repeatCount="indefinite"
+          calcMode="spline"
+          keySplines="0.42 0 0.58 1; 0.42 0 0.58 1"
+          keyTimes="0; 0.5; 1"
+          values="150.19999694824219; 126; 150.19999694824219" />
+      </feDisplacementMap>
+      <feMerge result="effect1_texture_1043_8">
+        <feMergeNode in="displacedImage"/>
+      </feMerge>
+    </filter>
+  </defs>
+</svg>
+
+<!-- Bottom-right blob (same shape family as top-left; duplicate copy removed). -->
+<svg class="corner-blob-bottom-right" viewBox="0 0 524 519" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <animate
+    attributeName="viewBox"
+    dur="6s"
+    repeatCount="indefinite"
+    values="
+      0 0 524 519;
+      0 0 500 495;
+      0 0 524 519"
+    keyTimes="0; 0.5; 1"
+    calcMode="spline"
+    keySplines="0.42 0 0.58 1; 0.42 0 0.58 1" />
+  <g filter="url(#filter0_g_br_1)">
+    <path fill="#1591DC">
+      <animate
+        attributeName="d"
+        dur="6s"
+        repeatCount="indefinite"
+        calcMode="spline"
+        keySplines="0.42 0 0.58 1; 0.42 0 0.58 1"
+        keyTimes="0; 0.5; 1"
+        values="
+          M379.313 274.077C377.713 233.677 423.98 181.244 447.313 160.077C461.313 92.0769 297.313 144.077 273.313 96.0768C249.313 48.0768 150.813 92.0769 98.8132 132.077C46.8132 172.077 90.8132 176.077 130.813 228.077C170.814 280.077 144.813 274.077 130.813 338.577C116.813 403.077 192.813 430.577 226.813 440.577C260.813 450.577 321.314 436.577 363.314 402.577C405.314 368.577 381.313 324.577 379.313 274.077Z;
+          M367.213 261.977C365.613 221.577 411.88 169.143 435.213 147.977C449.213 79.9768 285.213 131.977 261.213 83.9768C237.213 35.9768 138.713 79.9768 86.7131 119.977C34.7131 159.977 78.7131 163.977 118.713 215.977C158.714 267.977 132.713 261.977 118.713 326.477C104.713 390.977 180.713 418.477 214.713 428.477C248.713 438.477 309.213 424.477 351.213 390.477C393.213 356.477 369.213 312.477 367.213 261.977Z;
+          M379.313 274.077C377.713 233.677 423.98 181.244 447.313 160.077C461.313 92.0769 297.313 144.077 273.313 96.0768C249.313 48.0768 150.813 92.0769 98.8132 132.077C46.8132 172.077 90.8132 176.077 130.813 228.077C170.814 280.077 144.813 274.077 130.813 338.577C116.813 403.077 192.813 430.577 226.813 440.577C260.813 450.577 321.314 436.577 363.314 402.577C405.314 368.577 381.313 324.577 379.313 274.077Z"
+      />
+    </path>
+  </g>
+  <defs>
+    <filter id="filter0_g_br_1" x="9.91821e-05" y="9.91821e-05" width="523.26" height="518.839" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
+      <feFlood flood-opacity="0" result="BackgroundImageFix"/>
+      <feBlend mode="normal" in="SourceGraphic" in2="BackgroundImageFix" result="shape"/>
+      <feTurbulence type="fractalNoise" numOctaves="2" seed="6446" result="noise">
+        <animate
+          attributeName="baseFrequency"
+          dur="6s"
+          repeatCount="indefinite"
+          calcMode="spline"
+          keySplines="0.42 0 0.58 1; 0.42 0 0.58 1"
+          keyTimes="0; 0.5; 1"
+          values="
+            0.011454753577709198 0.011454753577709198;
+            0.014492753893136978 0.014492753893136978;
+            0.011454753577709198 0.011454753577709198" />
+      </feTurbulence>
+      <feDisplacementMap in="shape" in2="noise" xChannelSelector="R" yChannelSelector="G" result="displacedImage" width="100%" height="100%">
+        <animate
+          attributeName="scale"
+          dur="6s"
+          repeatCount="indefinite"
+          calcMode="spline"
+          keySplines="0.42 0 0.58 1; 0.42 0 0.58 1"
+          keyTimes="0; 0.5; 1"
+          values="150.19999694824219; 126; 150.19999694824219" />
+      </feDisplacementMap>
+      <feMerge result="effect1_texture_br_1">
+        <feMergeNode in="displacedImage"/>
+      </feMerge>
+    </filter>
+  </defs>
+</svg>
+
+<!-- Bottom-left blob, same family as top-right -->
+<svg class="corner-blob-bottom-left" viewBox="0 0 584 684" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <animate
+    attributeName="viewBox"
+    dur="6s"
+    repeatCount="indefinite"
+    values="
+      0 0 584 684;
+      0 0 490 609;
+      0 0 584 684"
+    keyTimes="0; 0.5; 1"
+    calcMode="spline"
+    keySplines="0.42 0 0.58 1; 0.42 0 0.58 1" />
+  <g filter="url(#filter0_g_bl_1)">
+    <path fill="#1591DC">
+      <animate
+        attributeName="d"
+        dur="6s"
+        repeatCount="indefinite"
+        calcMode="spline"
+        keySplines="0.42 0 0.58 1; 0.42 0 0.58 1"
+        keyTimes="0; 0.5; 1"
+        values="
+          M339.542 86.9999C263.942 127 171.708 165 135.042 179C100.542 192.717 51.0415 209 119.042 285.5C187.042 362 221.542 341.5 197.542 455.5C173.542 569.5 277.542 568 369.542 592C461.542 616 444.042 574 450.042 490C456.042 406 442.042 423.5 476.042 325.5C510.042 227.5 494.042 215 496.042 153C498.042 90.9999 434.042 36.9999 339.542 86.9999Z;
+          M292.941 58.1515C217.341 98.1515 125.108 136.152 88.4414 150.152C53.9414 163.868 4.44144 180.152 72.4414 256.652C140.441 333.152 174.941 312.652 150.941 426.652C126.941 540.652 230.941 539.152 322.941 563.152C414.941 587.152 397.441 545.152 403.441 461.152C409.441 377.152 395.441 394.652 429.441 296.652C463.441 198.652 447.441 186.152 449.441 124.152C451.441 62.1515 387.441 8.15154 292.941 58.1515Z;
+          M339.542 86.9999C263.942 127 171.708 165 135.042 179C100.542 192.717 51.0415 209 119.042 285.5C187.042 362 221.542 341.5 197.542 455.5C173.542 569.5 277.542 568 369.542 592C461.542 616 444.042 574 450.042 490C456.042 406 442.042 423.5 476.042 325.5C510.042 227.5 494.042 215 496.042 153C498.042 90.9999 434.042 36.9999 339.542 86.9999Z"
+      />
+    </path>
+  </g>
+  <defs>
+    <filter id="filter0_g_bl_1" x="9.91821e-05" y="-17.7516" width="583.191" height="701.549" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
+      <feFlood flood-opacity="0" result="BackgroundImageFix"/>
+      <feBlend mode="normal" in="SourceGraphic" in2="BackgroundImageFix" result="shape"/>
+      <feTurbulence type="fractalNoise" baseFrequency="0.017699114978313446 0.017699114978313446" numOctaves="2" seed="6899" result="noise"/>
+      <feDisplacementMap in="shape" in2="noise" xChannelSelector="R" yChannelSelector="G" result="displacedImage" width="100%" height="100%">
+        <animate
+          attributeName="scale"
+          dur="6s"
+          repeatCount="indefinite"
+          calcMode="spline"
+          keySplines="0.42 0 0.58 1; 0.42 0 0.58 1"
+          keyTimes="0; 0.5; 1"
+          values="170.19999694824219; 77; 170.19999694824219" />
+      </feDisplacementMap>
+      <feMerge result="effect1_texture_bl_1">
+        <feMergeNode in="displacedImage"/>
+      </feMerge>
+    </filter>
+  </defs>
+</svg>
+
+<!-- Scattered morph field. Shapes tagged "morph-edge" sit near the horizontal
+     edges of the 1705-wide viewBox and get cropped off by the
+     "xMidYMid slice" fit on narrow/tall viewports — hidden in perf-lite mode
+     with effectively no visual loss, for a real filter-count saving. -->
+<svg class="morph-layer" viewBox="0 0 1705 1080" preserveAspectRatio="xMidYMid slice" fill="none" xmlns="http://www.w3.org/2000/svg">
+<g opacity="0.64">
+<g class="morph-shape morph-edge" filter="url(#filter0_g_1044_19)">
+<path d="M313.864 87.0001C315.864 39.0001 245.864 55.0001 181.864 87.0001C164.364 99 124.964 134.6 107.364 181C85.3645 239 113.364 223 181.864 231C250.364 239 261.864 261.5 313.864 201C365.864 140.5 311.864 135 313.864 87.0001Z" fill="#C4E2F5"/>
+</g>
+<g class="morph-shape morph-center" filter="url(#filter1_g_1044_19)">
+<path d="M758.864 171C742.864 129 696.864 161 612.364 189C583.864 189 624.864 287.5 656.864 329.5C688.864 371.5 730.864 385.5 770.864 379.5C810.864 373.5 850.864 337.5 810.864 313.5C770.864 289.5 774.864 213 758.864 171Z" fill="#C4E2F5"/>
+</g>
+<g class="morph-shape morph-edge" filter="url(#filter2_g_1044_19)">
+<path d="M1269.86 135C1317.86 121 1368.36 101 1400.36 149V277.5C1400.36 348 1336.36 323.5 1307.86 331.5C1279.36 339.5 1237.86 339.5 1191.86 309.5C1145.86 279.5 1195.86 259.5 1205.86 235C1215.86 210.5 1221.86 149 1269.86 135Z" fill="#C4E2F5"/>
+</g>
+<g class="morph-shape morph-center" filter="url(#filter3_g_1044_19)">
+<path d="M824.864 570C774.364 588 770.864 626 712.864 672C684.311 698 740.864 792.5 758.864 794.5C776.864 796.5 852.864 748.5 852.864 724C852.864 699.5 873.364 688 905.364 672C937.364 656 943.364 614 935.364 570C927.364 526 875.364 552 824.864 570Z" fill="#C4E2F5"/>
+</g>
+<g class="morph-shape morph-edge" filter="url(#filter4_g_1044_19)">
+<path d="M1454.36 746.5C1388.36 756.5 1394.36 768.5 1378.36 828.5C1353.53 838.5 1300.26 868.9 1285.86 910.5C1267.86 962.5 1275.86 993 1378.36 979C1480.86 965 1466.36 997 1542.36 993C1618.36 989 1618.86 900.5 1576.86 880.5C1534.86 860.5 1550.36 828.5 1542.36 806.5C1534.36 784.5 1520.36 736.5 1454.36 746.5Z" fill="#C4E2F5"/>
+</g>
+<g class="morph-shape morph-center" filter="url(#filter5_g_1044_19)">
+<ellipse cx="1229.86" cy="620" rx="40" ry="110" transform="rotate(51.8086 1229.86 620)" fill="#C4E2F5"/>
+</g>
+<g class="morph-shape morph-edge" filter="url(#filter6_g_1044_19)">
+<path d="M267.864 562C203.864 536 219.864 566 171.864 660C137.864 682 157.864 720 191.864 736.5C225.864 753 209.864 740.5 205.864 814.5C201.864 888.5 291.864 870.5 343.864 864.5C395.864 858.5 438.364 820.5 412.364 766.5C386.364 712.5 365.864 708 357.864 688C349.864 668 331.864 588 267.864 562Z" fill="#C4E2F5"/>
+</g>
+<g class="morph-shape morph-center" filter="url(#filter7_g_1044_19)">
+<path d="M796.864 898.5C750.864 910.5 762.864 834.5 716.864 882.5C711.531 857.833 674.864 877.7 658.864 898.5C638.864 924.5 564.364 946.5 540.364 1007C516.364 1067.5 570.364 1017 678.864 1007C787.364 997 754.864 1017 828.864 1017C902.864 1017 885.364 1005 891.364 946.5C897.364 888 842.864 886.5 796.864 898.5Z" fill="#C4E2F5"/>
+</g>
+</g>
+<defs>
+<filter id="filter0_g_1044_19" x="0" y="-43.2942" width="436.538" height="385.061" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
+<feFlood flood-opacity="0" result="BackgroundImageFix"/>
+<feBlend mode="normal" in="SourceGraphic" in2="BackgroundImageFix" result="shape"/>
+<feTurbulence type="fractalNoise" numOctaves="2" seed="3800">
+<animate
+  attributeName="baseFrequency"
+  dur="40s"
+  repeatCount="indefinite"
+  calcMode="spline"
+  keySplines="0.42 0 0.58 1; 0.42 0 0.58 1"
+  keyTimes="0; 0.5; 1"
+  values="
+    0.041666667908430099 0.041666667908430099;
+    0.022573363035917282 0.022573363035917282;
+    0.041666667908430099 0.041666667908430099" />
+</feTurbulence>
+<feDisplacementMap in="shape" scale="200" xChannelSelector="R" yChannelSelector="G" result="displacedImage" width="100%" height="100%" />
+<feMerge result="effect1_texture_1044_19">
+<feMergeNode in="displacedImage"/>
+</feMerge>
+</filter>
+<filter id="filter1_g_1044_19" x="502.767" y="50.7498" width="424.666" height="430.074" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
+<feFlood flood-opacity="0" result="BackgroundImageFix"/>
+<feBlend mode="normal" in="SourceGraphic" in2="BackgroundImageFix" result="shape"/>
+<feTurbulence type="fractalNoise" numOctaves="2" seed="3800">
+<animate
+  attributeName="baseFrequency"
+  dur="40s"
+  repeatCount="indefinite"
+  calcMode="spline"
+  keySplines="0.42 0 0.58 1; 0.42 0 0.58 1"
+  keyTimes="0; 0.5; 1"
+  values="
+    0.041666667908430099 0.041666667908430099;
+    0.017605634406208992 0.017605634406208992;
+    0.041666667908430099 0.041666667908430099" />
+</feTurbulence>
+<feDisplacementMap in="shape" scale="200" xChannelSelector="R" yChannelSelector="G" result="displacedImage" width="100%" height="100%" />
+<feMerge result="effect1_texture_1044_19">
+<feMergeNode in="displacedImage"/>
+</feMerge>
+</filter>
+<filter id="filter2_g_1044_19" x="1072.71" y="18.6965" width="427.658" height="417.324" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
+<feFlood flood-opacity="0" result="BackgroundImageFix"/>
+<feBlend mode="normal" in="SourceGraphic" in2="BackgroundImageFix" result="shape"/>
+<feTurbulence type="fractalNoise" numOctaves="2" seed="3800">
+<animate
+  attributeName="baseFrequency"
+  dur="40s"
+  repeatCount="indefinite"
+  calcMode="spline"
+  keySplines="0.42 0 0.58 1; 0.42 0 0.58 1"
+  keyTimes="0; 0.5; 1"
+  values="
+    0.041666667908430099 0.041666667908430099;
+    0.025062656030058861 0.025062656030058861;
+    0.041666667908430099 0.041666667908430099" />
+</feTurbulence>
+<feDisplacementMap in="shape" scale="200" xChannelSelector="R" yChannelSelector="G" result="displacedImage" width="100%" height="100%" />
+<feMerge result="effect1_texture_1044_19">
+<feMergeNode in="displacedImage"/>
+</feMerge>
+</filter>
+<filter id="filter3_g_1044_19" x="604.952" y="445.803" width="433.602" height="448.757" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
+<feFlood flood-opacity="0" result="BackgroundImageFix"/>
+<feBlend mode="normal" in="SourceGraphic" in2="BackgroundImageFix" result="shape"/>
+<feTurbulence type="fractalNoise" numOctaves="2" seed="3800">
+<animate
+  attributeName="baseFrequency"
+  dur="40s"
+  repeatCount="indefinite"
+  calcMode="spline"
+  keySplines="0.42 0 0.58 1; 0.42 0 0.58 1"
+  keyTimes="0; 0.5; 1"
+  values="
+    0.035087719559669495 0.035087719559669495;
+    0.020790021866559982 0.020790021866559982;
+    0.035087719559669495 0.035087719559669495" />
+</feTurbulence>
+<feDisplacementMap in="shape" scale="200" xChannelSelector="R" yChannelSelector="G" result="displacedImage" width="100%" height="100%" />
+<feMerge result="effect1_texture_1044_19">
+<feMergeNode in="displacedImage"/>
+</feMerge>
+</filter>
+<filter id="filter4_g_1044_19" x="1178.3" y="645.147" width="526.551" height="448.202" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
+<feFlood flood-opacity="0" result="BackgroundImageFix"/>
+<feBlend mode="normal" in="SourceGraphic" in2="BackgroundImageFix" result="shape"/>
+<feTurbulence type="fractalNoise" numOctaves="2" seed="3800">
+<animate
+  attributeName="baseFrequency"
+  dur="40s"
+  repeatCount="indefinite"
+  calcMode="spline"
+  keySplines="0.42 0 0.58 1; 0.42 0 0.58 1"
+  keyTimes="0; 0.5; 1"
+  values="
+    0.041666667908430099 0.041666667908430099;
+    0.02380952425301075 0.02380952425301075;
+    0.041666667908430099 0.041666667908430099" />
+</feTurbulence>
+<feDisplacementMap in="shape" scale="200" xChannelSelector="R" yChannelSelector="G" result="displacedImage" width="100%" height="100%" />
+<feMerge result="effect1_texture_1044_19">
+<feMergeNode in="displacedImage"/>
+</feMerge>
+</filter>
+<filter id="filter5_g_1044_19" x="1039.92" y="445.055" width="379.891" height="349.889" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
+<feFlood flood-opacity="0" result="BackgroundImageFix"/>
+<feBlend mode="normal" in="SourceGraphic" in2="BackgroundImageFix" result="shape"/>
+<feTurbulence type="fractalNoise" numOctaves="2" seed="3800">
+<animate
+  attributeName="baseFrequency"
+  dur="40s"
+  repeatCount="indefinite"
+  calcMode="spline"
+  keySplines="0.42 0 0.58 1; 0.42 0 0.58 1"
+  keyTimes="0; 0.5; 1"
+  values="
+    0.041666667908430099 0.041666667908430099;
+    0.027624309062957764 0.027624309062957764;
+    0.041666667908430099 0.041666667908430099" />
+</feTurbulence>
+<feDisplacementMap in="shape" scale="200" xChannelSelector="R" yChannelSelector="G" result="displacedImage" width="100%" height="100%" />
+<feMerge result="effect1_texture_1044_19">
+<feMergeNode in="displacedImage"/>
+</feMerge>
+</filter>
+<filter id="filter6_g_1044_19" x="54.2715" y="453.044" width="465.957" height="517.788" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
+<feFlood flood-opacity="0" result="BackgroundImageFix"/>
+<feBlend mode="normal" in="SourceGraphic" in2="BackgroundImageFix" result="shape"/>
+<feTurbulence type="fractalNoise" numOctaves="2" seed="3800">
+<animate
+  attributeName="baseFrequency"
+  dur="40s"
+  repeatCount="indefinite"
+  calcMode="spline"
+  keySplines="0.42 0 0.58 1; 0.42 0 0.58 1"
+  keyTimes="0; 0.5; 1"
+  values="
+    0.041666667908430099 0.041666667908430099;
+    0.02604166604578495 0.02604166604578495;
+    0.041666667908430099 0.041666667908430099" />
+</feTurbulence>
+<feDisplacementMap in="shape" scale="200" xChannelSelector="R" yChannelSelector="G" result="displacedImage" width="100%" height="100%" />
+<feMerge result="effect1_texture_1044_19">
+<feMergeNode in="displacedImage"/>
+</feMerge>
+</filter>
+<filter id="filter7_g_1044_19" x="434.737" y="766.432" width="557.082" height="369.82" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
+<feFlood flood-opacity="0" result="BackgroundImageFix"/>
+<feBlend mode="normal" in="SourceGraphic" in2="BackgroundImageFix" result="shape"/>
+<feTurbulence type="fractalNoise" numOctaves="2" seed="3800">
+<animate
+  attributeName="baseFrequency"
+  dur="40s"
+  repeatCount="indefinite"
+  calcMode="spline"
+  keySplines="0.42 0 0.58 1; 0.42 0 0.58 1"
+  keyTimes="0; 0.5; 1"
+  values="
+    0.041666667908430099 0.041666667908430099;
+    0.022573363035917282 0.022573363035917282;
+    0.041666667908430099 0.041666667908430099" />
+</feTurbulence>
+<feDisplacementMap in="shape" scale="200" xChannelSelector="R" yChannelSelector="G" result="displacedImage" width="100%" height="100%" />
+<feMerge result="effect1_texture_1044_19">
+<feMergeNode in="displacedImage"/>
+</feMerge>
+</filter>
+</defs>
+</svg>
+
+<!-- WAVE OVERLAY: sweeps top-right -> bottom-left. wave-a always renders;
+     wave-b/wave-c are dropped in perf-lite mode (see CSS above). -->
+<div class="wave-stage">
+  <svg class="wave-svg" viewBox="0 0 1920 1080" preserveAspectRatio="xMidYMid slice" xmlns="http://www.w3.org/2000/svg">
+    <defs>
+      <filter id="waveTexture" filterUnits="objectBoundingBox" x="-30%" y="-30%" width="160%" height="160%" color-interpolation-filters="sRGB">
+        <feTurbulence type="fractalNoise" numOctaves="2" seed="42" result="noise">
+          <animate
+            attributeName="baseFrequency"
+            dur="6s"
+            repeatCount="indefinite"
+            calcMode="spline"
+            keySplines="0.42 0 0.58 1"
+            keyTimes="0; 1"
+            values="0.0065 0.0065; 0.011 0.011" />
+        </feTurbulence>
+        <feDisplacementMap in="SourceGraphic" in2="noise" xChannelSelector="R" yChannelSelector="G">
+          <animate
+            attributeName="scale"
+            dur="6s"
+            repeatCount="indefinite"
+            calcMode="spline"
+            keySplines="0.42 0 0.58 1"
+            keyTimes="0; 1"
+            values="10; 20" />
+        </feDisplacementMap>
+      </filter>
+    </defs>
+
+    <!-- Wave A: starts immediately at 0s -->
+    <g class="wave-mover wave-a" filter="url(#waveTexture)">
+      <animateTransform
+        attributeName="transform"
+        attributeType="XML"
+        type="translate"
+        begin="0s"
+        dur="6s"
+        repeatCount="indefinite"
+        calcMode="spline"
+        keySplines="0.42 0 0.58 1"
+        keyTimes="0; 1"
+        values="470 -330; -560 390" />
+
+      <path fill="#C4E2F5">
+        <animate
+          attributeName="opacity"
+          begin="0s"
+          dur="6s"
+          repeatCount="indefinite"
+          calcMode="spline"
+          keySplines="0.3 0 0.7 1; 0.42 0 0.58 1; 0.3 0 0.7 1"
+          keyTimes="0; 0.12; 0.85; 1"
+          values="0; 0.8; 0.8; 0" />
+
+        <animate
+          attributeName="d"
+          begin="0s"
+          dur="6s"
+          repeatCount="indefinite"
+          calcMode="spline"
+          keySplines="0.42 0 0.58 1"
+          keyTimes="0; 1"
+          values="
+            M445.881 -95.9492C390.212 -333.175 308.797 -274.042 24.8875 -313C-69.749 -242.737 133.441 -240.65 169.626 -232.302C205.81 -223.954 303.23 -165.517 365.161 -51.4259C427.092 62.6649 381.862 49.447 392.995 132.928C404.129 216.409 445.881 291.542 465.365 364.588C484.849 437.634 699.868 420.242 800.071 467.548C900.275 514.854 947.593 470.331 1031.79 487.027C1115.99 503.723 1134.78 559.377 1223.85 606.683C1295.1 644.528 1356.06 732.369 1377.63 771.558C1422.17 826.285 1533.5 953.13 1622.57 1022.7C1733.91 1109.66 1734.61 1061.66 1845.94 1072.79C1957.28 1083.92 1983.03 1108.96 2063.75 1147.92C2144.47 1186.88 2111.06 1214.7 2133.33 1289.84C2155.6 1364.97 2247.45 1326.71 2275.29 1289.84C2303.12 1252.97 2222.4 1195.22 2180.65 1122.87C2138.9 1050.52 2002.51 1028.26 1845.94 1022.7C1689.38 1017.13 1578.04 899.563 1399.9 690.86C1223.4 484.076 1166.44 465.101 1035.46 421.464C1034.2367 421.0567 1033.0133 420.6493 1031.79 420.242C898.187 375.719 847.39 481.462 610.103 339.544C491.4595 268.585 464.321 219.018 459.884875 157.5376C455.44875 96.0572 473.715 22.6634 445.881 -95.9492Z;
+            M176.997 115.369C74.997 -7.03098 22.8303 -8.29764 9.49701 6.36903C2.33034 31.7024 -7.70299 85.3691 9.49701 97.3691C30.997 112.369 75.497 140.869 144.497 260.869C213.497 380.869 275.497 337.369 304.497 373.869C333.497 410.369 431.997 464.869 511.997 497.369C591.997 529.869 679.497 526.869 752.497 552.369C825.497 577.869 846.997 624.869 912.497 726.869C977.997 828.869 959.997 814.369 1062 901.869C1164 989.369 1178.5 985.369 1357 1163.87C1444.5 1229.37 1386 1185.87 1524 1229.37C1662 1272.87 1644.5 1287.87 1710 1360.37C1775.5 1432.87 1764.5 1436.87 1804.5 1495.37C1844.5 1553.87 1899 1524.37 2008.5 1582.37C2118 1640.37 2092 1684.37 2128.5 1720.87C2165 1757.37 2212.5 1698.87 2256 1655.37C2299.5 1611.87 2121.5 1553.37 2008.5 1495.37C1895.5 1437.37 1702.5 1247.37 1644.5 1185.87C1586.5 1124.37 1462.5 1083.87 1386 1050.87C1309.5 1017.87 1131 894.369 1083.5 814.369C1036 734.369 952.497 650.369 846.997 526.869C741.497 403.369 610.497 431.869 475.497 402.869C340.497 373.869 304.497 268.369 176.997 115.369Z" />
+      </path>
+    </g>
+
+    <!-- Wave B: starts 2s later (dropped in perf-lite) -->
+    <g class="wave-mover wave-b" filter="url(#waveTexture)">
+      <animateTransform
+        attributeName="transform"
+        attributeType="XML"
+        type="translate"
+        begin="2s"
+        dur="6s"
+        repeatCount="indefinite"
+        calcMode="spline"
+        keySplines="0.42 0 0.58 1"
+        keyTimes="0; 1"
+        values="470 -330; -560 390" />
+
+      <path fill="#C4E2F5">
+        <animate
+          attributeName="opacity"
+          begin="2s"
+          dur="6s"
+          repeatCount="indefinite"
+          calcMode="spline"
+          keySplines="0.3 0 0.7 1; 0.42 0 0.58 1; 0.3 0 0.7 1"
+          keyTimes="0; 0.12; 0.85; 1"
+          values="0; 0.8; 0.8; 0" />
+
+        <animate
+          attributeName="d"
+          begin="2s"
+          dur="6s"
+          repeatCount="indefinite"
+          calcMode="spline"
+          keySplines="0.42 0 0.58 1"
+          keyTimes="0; 1"
+          values="
+            M445.881 -95.9492C390.212 -333.175 308.797 -274.042 24.8875 -313C-69.749 -242.737 133.441 -240.65 169.626 -232.302C205.81 -223.954 303.23 -165.517 365.161 -51.4259C427.092 62.6649 381.862 49.447 392.995 132.928C404.129 216.409 445.881 291.542 465.365 364.588C484.849 437.634 699.868 420.242 800.071 467.548C900.275 514.854 947.593 470.331 1031.79 487.027C1115.99 503.723 1134.78 559.377 1223.85 606.683C1295.1 644.528 1356.06 732.369 1377.63 771.558C1422.17 826.285 1533.5 953.13 1622.57 1022.7C1733.91 1109.66 1734.61 1061.66 1845.94 1072.79C1957.28 1083.92 1983.03 1108.96 2063.75 1147.92C2144.47 1186.88 2111.06 1214.7 2133.33 1289.84C2155.6 1364.97 2247.45 1326.71 2275.29 1289.84C2303.12 1252.97 2222.4 1195.22 2180.65 1122.87C2138.9 1050.52 2002.51 1028.26 1845.94 1022.7C1689.38 1017.13 1578.04 899.563 1399.9 690.86C1223.4 484.076 1166.44 465.101 1035.46 421.464C1034.2367 421.0567 1033.0133 420.6493 1031.79 420.242C898.187 375.719 847.39 481.462 610.103 339.544C491.4595 268.585 464.321 219.018 459.884875 157.5376C455.44875 96.0572 473.715 22.6634 445.881 -95.9492Z;
+            M176.997 115.369C74.997 -7.03098 22.8303 -8.29764 9.49701 6.36903C2.33034 31.7024 -7.70299 85.3691 9.49701 97.3691C30.997 112.369 75.497 140.869 144.497 260.869C213.497 380.869 275.497 337.369 304.497 373.869C333.497 410.369 431.997 464.869 511.997 497.369C591.997 529.869 679.497 526.869 752.497 552.369C825.497 577.869 846.997 624.869 912.497 726.869C977.997 828.869 959.997 814.369 1062 901.869C1164 989.369 1178.5 985.369 1357 1163.87C1444.5 1229.37 1386 1185.87 1524 1229.37C1662 1272.87 1644.5 1287.87 1710 1360.37C1775.5 1432.87 1764.5 1436.87 1804.5 1495.37C1844.5 1553.87 1899 1524.37 2008.5 1582.37C2118 1640.37 2092 1684.37 2128.5 1720.87C2165 1757.37 2212.5 1698.87 2256 1655.37C2299.5 1611.87 2121.5 1553.37 2008.5 1495.37C1895.5 1437.37 1702.5 1247.37 1644.5 1185.87C1586.5 1124.37 1462.5 1083.87 1386 1050.87C1309.5 1017.87 1131 894.369 1083.5 814.369C1036 734.369 952.497 650.369 846.997 526.869C741.497 403.369 610.497 431.869 475.497 402.869C340.497 373.869 304.497 268.369 176.997 115.369Z" />
+      </path>
+    </g>
+
+    <!-- Wave C: starts 4s later (dropped in perf-lite) -->
+    <g class="wave-mover wave-c" filter="url(#waveTexture)">
+      <animateTransform
+        attributeName="transform"
+        attributeType="XML"
+        type="translate"
+        begin="4s"
+        dur="6s"
+        repeatCount="indefinite"
+        calcMode="spline"
+        keySplines="0.42 0 0.58 1"
+        keyTimes="0; 1"
+        values="470 -330; -560 390" />
+
+      <path fill="#C4E2F5">
+        <animate
+          attributeName="opacity"
+          begin="4s"
+          dur="6s"
+          repeatCount="indefinite"
+          calcMode="spline"
+          keySplines="0.3 0 0.7 1; 0.42 0 0.58 1; 0.3 0 0.7 1"
+          keyTimes="0; 0.12; 0.85; 1"
+          values="0; 0.8; 0.8; 0" />
+
+        <animate
+          attributeName="d"
+          begin="4s"
+          dur="6s"
+          repeatCount="indefinite"
+          calcMode="spline"
+          keySplines="0.42 0 0.58 1"
+          keyTimes="0; 1"
+          values="
+            M445.881 -95.9492C390.212 -333.175 308.797 -274.042 24.8875 -313C-69.749 -242.737 133.441 -240.65 169.626 -232.302C205.81 -223.954 303.23 -165.517 365.161 -51.4259C427.092 62.6649 381.862 49.447 392.995 132.928C404.129 216.409 445.881 291.542 465.365 364.588C484.849 437.634 699.868 420.242 800.071 467.548C900.275 514.854 947.593 470.331 1031.79 487.027C1115.99 503.723 1134.78 559.377 1223.85 606.683C1295.1 644.528 1356.06 732.369 1377.63 771.558C1422.17 826.285 1533.5 953.13 1622.57 1022.7C1733.91 1109.66 1734.61 1061.66 1845.94 1072.79C1957.28 1083.92 1983.03 1108.96 2063.75 1147.92C2144.47 1186.88 2111.06 1214.7 2133.33 1289.84C2155.6 1364.97 2247.45 1326.71 2275.29 1289.84C2303.12 1252.97 2222.4 1195.22 2180.65 1122.87C2138.9 1050.52 2002.51 1028.26 1845.94 1022.7C1689.38 1017.13 1578.04 899.563 1399.9 690.86C1223.4 484.076 1166.44 465.101 1035.46 421.464C1034.2367 421.0567 1033.0133 420.6493 1031.79 420.242C898.187 375.719 847.39 481.462 610.103 339.544C491.4595 268.585 464.321 219.018 459.884875 157.5376C455.44875 96.0572 473.715 22.6634 445.881 -95.9492Z;
+            M176.997 115.369C74.997 -7.03098 22.8303 -8.29764 9.49701 6.36903C2.33034 31.7024 -7.70299 85.3691 9.49701 97.3691C30.997 112.369 75.497 140.869 144.497 260.869C213.497 380.869 275.497 337.369 304.497 373.869C333.497 410.369 431.997 464.869 511.997 497.369C591.997 529.869 679.497 526.869 752.497 552.369C825.497 577.869 846.997 624.869 912.497 726.869C977.997 828.869 959.997 814.369 1062 901.869C1164 989.369 1178.5 985.369 1357 1163.87C1444.5 1229.37 1386 1185.87 1524 1229.37C1662 1272.87 1644.5 1287.87 1710 1360.37C1775.5 1432.87 1764.5 1436.87 1804.5 1495.37C1844.5 1553.87 1899 1524.37 2008.5 1582.37C2118 1640.37 2092 1684.37 2128.5 1720.87C2165 1757.37 2212.5 1698.87 2256 1655.37C2299.5 1611.87 2121.5 1553.37 2008.5 1495.37C1895.5 1437.37 1702.5 1247.37 1644.5 1185.87C1586.5 1124.37 1462.5 1083.87 1386 1050.87C1309.5 1017.87 1131 894.369 1083.5 814.369C1036 734.369 952.497 650.369 846.997 526.869C741.497 403.369 610.497 431.869 475.497 402.869C340.497 373.869 304.497 268.369 176.997 115.369Z" />
+      </path>
+    </g>
+  </svg>
+</div>
+<div id="led"></div>
+
+<script>
+  // Detect small viewport OR weak-but-wide hardware (budget tablets, older
+  // laptops) and drop to the lighter effect set. No more 10,000-div loop here.
+  (function () {
+    var coarseHardware =
+      (navigator.hardwareConcurrency && navigator.hardwareConcurrency <= 4) ||
+      (navigator.deviceMemory && navigator.deviceMemory <= 4);
+    var smallViewport = window.matchMedia('(max-width: 768px)').matches;
+
+    function applyPerfMode() {
+      var lite = smallViewport || coarseHardware;
+      document.body.classList.toggle('perf-lite', lite);
+    }
+    applyPerfMode();
+    window.matchMedia('(max-width: 768px)').addEventListener('change', function (e) {
+      smallViewport = e.matches;
+      applyPerfMode();
+    });
+  })();
+</script>
+
+<script>
+  // Respect the user's reduced-motion preference by freezing every SMIL
+  // animation on every <svg> on the page.
+  (function () {
+    var query = window.matchMedia('(prefers-reduced-motion: reduce)');
+    function applyMotionPreference(reduce) {
+      document.querySelectorAll('svg').forEach(function (svg) {
+        if (typeof svg.pauseAnimations === 'function' && typeof svg.unpauseAnimations === 'function') {
+          reduce ? svg.pauseAnimations() : svg.unpauseAnimations();
+        }
+      });
+    }
+    applyMotionPreference(query.matches);
+    query.addEventListener('change', function (e) { applyMotionPreference(e.matches); });
+  })();
+</script>
+
+</body>
+</html>
