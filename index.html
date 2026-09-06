@@ -5,12 +5,6 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>Blob Morph + Wave Sweep (Optimized)</title>
 
-<!--
-  Runs synchronously, before the body (and its heavy SVG filters) is even
-  parsed, so `html.perf-lite` is already set by the time those elements
-  render. Without this, the page briefly paints the full-cost version and
-  then strips it back a frame or two later.
--->
 <script>
 (function () {
   var coarse = (navigator.hardwareConcurrency && navigator.hardwareConcurrency <= 4) ||
@@ -22,50 +16,6 @@
 </script>
 
 <style>
-
-  /*
-    OPTIMIZATION NOTES (read me):
-    1. The old #led grid created 10,000 <div>s via JS. Replaced with a single
-       CSS repeating-linear-gradient — same visual, zero extra DOM nodes.
-    2. Each corner used to render TWO overlapping filtered blobs (phase-offset
-       "echo"). One copy per corner is deleted below — the remaining blob
-       already morphs through both shapes, so the visual loss is minimal but
-       it HALVES the SVG filter cost for those two corners.
-    3. feTurbulence numOctaves dropped 3->2 on every decorative (non-hero)
-       filter. Cheaper noise generation, same organic look at these sizes.
-    4. A "perf-lite" mode kicks in on small viewports AND on wide-but-weak
-       devices (low hardwareConcurrency/deviceMemory, e.g. budget tablets).
-       It hides the 4 morph-field shapes that get cropped off-screen on
-       narrow viewports anyway, cuts the 3-wave sweep down to 1, drops the
-       wave's turbulence filter (keeps the smooth path motion), and swaps
-       the expensive `mix-blend-mode: screen` for plain opacity.
-    5. Reduced-motion handling now also pauses perf-lite-hidden layers.
-    6. The 4 corner blobs are barely/never visible on mobile & tablet widths
-       (covered by the enlarged main blob, or shoved off toward clipped
-       edges). Below 900px they are now fully REMOVED from the DOM by JS —
-       not just hidden — so their filters never get created, never get
-       painted, and their SMIL timers never tick. A CSS `display:none`
-       fallback at the same breakpoint covers no-JS environments (it won't
-       free the animation cost, but it stops the paint cost).
-    7. FROZEN TURBULENCE (the big one). Two filter pipelines animate
-       `baseFrequency` on their <feTurbulence>: the main blob, and the 4
-       "morph-center" background blobs. Animating baseFrequency forces the
-       browser to fully regenerate the noise texture every frame — it's the
-       single most expensive operation on this page, independent of shape
-       size. The morph-center blobs never move otherwise (their `d` is
-       static), so in perf-lite their baseFrequency animation is removed
-       entirely and replaced with a static mid-cycle value: the filter
-       becomes fully static and is effectively free after first paint, with
-       ~no visible difference (it was a slow, subtle 40s wobble). The main
-       blob's shape keeps morphing either way, so its turbulence can't be
-       made fully static, but freezing baseFrequency still lets the browser
-       reuse the generated noise texture across frames instead of
-       resynthesizing it, which is the majority of that filter's cost.
-    8. perf-lite is now applied to `html` (not `body`) via a synchronous
-       head script, so the CSS-driven parts of perf-lite (hidden layers,
-       blend mode swap) apply before first paint instead of after.
-  */
-
   :root {
     --corner-blob-lg: clamp(120px, 20vw, 260px);
     --corner-blob-sm: clamp(96px, 17vw, 220px);
@@ -82,7 +32,7 @@
     display: flex;
     align-items: center;
     justify-content: center;
-    background: linear-gradient(135deg, #2C5EAD, #1591DC);
+    background: linear-gradient(135deg, #0F3A5C, #1C9CD7);
     position: relative;
     overflow: hidden;
   }
@@ -134,8 +84,6 @@
     transform-origin: bottom left;
   }
 
-  /* Full-screen scattered morph layer — sits above corner blobs (z-index 5),
-     below the wave sweep (z-index 10). */
   svg.morph-layer {
     position: fixed;
     inset: 0;
@@ -146,8 +94,6 @@
     contain: layout style paint;
   }
 
-  /* Wave overlay sits above everything. Screen blend only on capable devices
-     (see .perf-lite override below) since it's costly to compose on weak GPUs. */
   .wave-stage {
     opacity: .7;
     position: fixed;
@@ -164,7 +110,6 @@
     display: block;
   }
 
-  /* Faint grid overlay — was 10,000 DOM nodes, now a single CSS pattern. */
   #led {
     position: absolute;
     inset: 0;
@@ -174,9 +119,9 @@
     z-index: 100;
     pointer-events: none;
     background-image:
-      linear-gradient(to right, #333 1px, transparent 1px),
-      linear-gradient(to bottom, #333 1px, transparent 1px);
-    background-size: 1% 1%; /* mimics the old 100x100 desktop grid */
+      linear-gradient(to right, #0F3A5C 1px, transparent 1px),
+      linear-gradient(to bottom, #0F3A5C 1px, transparent 1px);
+    background-size: 1% 1%;
   }
 
   @media (max-width: 900px) {
@@ -185,7 +130,7 @@
       --corner-blob-sm: clamp(76px, 14vw, 170px);
     }
     svg.main-blob { width: 72vw; }
-    #led { background-size: 5% 2.5%; } /* mimics the old 20x40 mobile grid */
+    #led { background-size: 5% 2.5%; }
   }
 
   @media (max-width: 600px) {
@@ -197,8 +142,6 @@
     svg.main-blob { width: 82vw; max-width: 420px; }
   }
 
-  /* No-JS fallback: JS removes these from the DOM entirely below 900px
-     (see script at the bottom). This just stops paint if JS is disabled. */
   @media (max-width: 900px) {
     .corner-slot { display: none; }
   }
@@ -211,35 +154,14 @@
     }
   }
 
-  /* ---- perf-lite: applied to <html> by the head script (before paint) and
-     kept in sync by the bottom script (resize / orientation change). ---- */
-
-  /* Morph shapes near the edges of the 1705x1080 viewBox get cropped out by
-     `preserveAspectRatio="xMidYMid slice"` on narrow/tall viewports anyway —
-     hiding them here is a pure perf win with ~no visual change. JS also
-     removes them from the DOM entirely (see bottom script). */
   html.perf-lite .morph-edge { display: none; }
 
-  /* Cut 3 concurrent wave sweeps down to 1. */
   html.perf-lite .wave-b,
   html.perf-lite .wave-c { display: none; }
 
-  /* Drop the wave's turbulence/displacement filter (CSS filter overrides the
-     SVG presentation attribute) — keeps the smooth path + fade motion,
-     removes the priciest part of the effect. Also swap the blend mode. */
   html.perf-lite .wave-mover { filter: none !important; }
   html.perf-lite .wave-stage { mix-blend-mode: normal; opacity: .35; }
 
-  /* The morph-center blobs' turbulence baseFrequency is frozen by JS in
-     perf-lite (see bottom script) — that's the actual cost saving, since it
-     stops the filter from being recomputed every frame. But a fully static
-     shape looks dead next to everything else that's moving. `transform` and
-     `opacity` are compositor-only properties — animating them costs almost
-     nothing (no repaint, no filter recompute) — so they replace the
-     turbulence wobble as the *visible* motion instead of removing motion
-     altogether. `:nth-of-type` lines up with the fixed edge/center ordering
-     of the .morph-shape siblings (edge, center, edge, center, ...), so no
-     extra class or JS is needed to tell the four center blobs apart. */
   @keyframes morph-drift-a {
     0%, 100% { transform: translate(0, 0) scale(1); }
     50%      { transform: translate(10px, -12px) scale(1.06); }
@@ -256,14 +178,13 @@
   html.perf-lite .morph-center:nth-of-type(4n) {
     animation-name: morph-drift-b;
     animation-duration: 11s;
-    animation-delay: -4s; /* desyncs it from the odd-position blobs */
+    animation-delay: -4s;
   }
 
 </style>
 </head>
 <body>
 
-<!-- Original centered blob (kept full quality — this is the hero element) -->
 <svg class="main-blob" viewBox="0 0 717 780" fill="none" xmlns="http://www.w3.org/2000/svg">
   <animate
     attributeName="viewBox"
@@ -277,7 +198,7 @@
     calcMode="spline"
     keySplines="0.42 0 0.58 1; 0.42 0 0.58 1" />
   <g filter="url(#filter0_g_1041_5)">
-    <path fill="#1591DC">
+    <path fill="#1C9CD7">
       <animate
         attributeName="d"
         dur="6s"
@@ -326,7 +247,6 @@
   </defs>
 </svg>
 
-<!-- Top-right corner blob -->
 <div class="corner-slot" data-slot="tr">
 <svg class="corner-blob" viewBox="0 0 584 684" fill="none" xmlns="http://www.w3.org/2000/svg">
   <animate
@@ -341,7 +261,7 @@
     calcMode="spline"
     keySplines="0.42 0 0.58 1; 0.42 0 0.58 1" />
   <g filter="url(#filter0_g_1043_7)">
-    <path fill="#1591DC">
+    <path fill="#1C9CD7">
       <animate
         attributeName="d"
         dur="6s"
@@ -379,9 +299,6 @@
 </svg>
 </div>
 
-<!-- Top-left corner blob. (Previously two overlapping phase-offset copies —
-     one deleted. This single blob already morphs through both shapes, so
-     the "echo" is gone but the motion is unchanged, at half the filter cost.) -->
 <div class="corner-slot" data-slot="tl">
 <svg class="corner-blob-left" viewBox="0 0 524 519" fill="none" xmlns="http://www.w3.org/2000/svg">
   <animate
@@ -396,7 +313,7 @@
     calcMode="spline"
     keySplines="0.42 0 0.58 1; 0.42 0 0.58 1" />
   <g filter="url(#filter0_g_1043_8)">
-    <path fill="#1591DC">
+    <path fill="#1C9CD7">
       <animate
         attributeName="d"
         dur="6s"
@@ -446,7 +363,6 @@
 </svg>
 </div>
 
-<!-- Bottom-right blob (same shape family as top-left; duplicate copy removed). -->
 <div class="corner-slot" data-slot="br">
 <svg class="corner-blob-bottom-right" viewBox="0 0 524 519" fill="none" xmlns="http://www.w3.org/2000/svg">
   <animate
@@ -461,7 +377,7 @@
     calcMode="spline"
     keySplines="0.42 0 0.58 1; 0.42 0 0.58 1" />
   <g filter="url(#filter0_g_br_1)">
-    <path fill="#1591DC">
+    <path fill="#1C9CD7">
       <animate
         attributeName="d"
         dur="6s"
@@ -511,7 +427,6 @@
 </svg>
 </div>
 
-<!-- Bottom-left blob, same family as top-right -->
 <div class="corner-slot" data-slot="bl">
 <svg class="corner-blob-bottom-left" viewBox="0 0 584 684" fill="none" xmlns="http://www.w3.org/2000/svg">
   <animate
@@ -526,7 +441,7 @@
     calcMode="spline"
     keySplines="0.42 0 0.58 1; 0.42 0 0.58 1" />
   <g filter="url(#filter0_g_bl_1)">
-    <path fill="#1591DC">
+    <path fill="#1C9CD7">
       <animate
         attributeName="d"
         dur="6s"
@@ -564,40 +479,31 @@
 </svg>
 </div>
 
-<!-- Scattered morph field. Shapes tagged "morph-edge" sit near the horizontal
-     edges of the 1705-wide viewBox and get cropped off by the
-     "xMidYMid slice" fit on narrow/tall viewports — hidden AND removed from
-     the DOM in perf-lite mode with effectively no visual loss.
-     Shapes tagged "morph-center" never move (their `d` is static) — only
-     their turbulence baseFrequency animates, purely for a subtle 40s
-     wobble. In perf-lite that animation is removed by JS below and a
-     static baseFrequency attribute (already on each <feTurbulence> here)
-     takes over, making the whole filter static and effectively free. -->
 <svg class="morph-layer" viewBox="0 0 1705 1080" preserveAspectRatio="xMidYMid slice" fill="none" xmlns="http://www.w3.org/2000/svg">
 <g opacity="0.64">
 <g class="morph-shape morph-edge" filter="url(#filter0_g_1044_19)">
-<path d="M313.864 87.0001C315.864 39.0001 245.864 55.0001 181.864 87.0001C164.364 99 124.964 134.6 107.364 181C85.3645 239 113.364 223 181.864 231C250.364 239 261.864 261.5 313.864 201C365.864 140.5 311.864 135 313.864 87.0001Z" fill="#C4E2F5"/>
+<path d="M313.864 87.0001C315.864 39.0001 245.864 55.0001 181.864 87.0001C164.364 99 124.964 134.6 107.364 181C85.3645 239 113.364 223 181.864 231C250.364 239 261.864 261.5 313.864 201C365.864 140.5 311.864 135 313.864 87.0001Z" fill="#7BC5E8"/>
 </g>
 <g class="morph-shape morph-center" filter="url(#filter1_g_1044_19)">
-<path d="M758.864 171C742.864 129 696.864 161 612.364 189C583.864 189 624.864 287.5 656.864 329.5C688.864 371.5 730.864 385.5 770.864 379.5C810.864 373.5 850.864 337.5 810.864 313.5C770.864 289.5 774.864 213 758.864 171Z" fill="#C4E2F5"/>
+<path d="M758.864 171C742.864 129 696.864 161 612.364 189C583.864 189 624.864 287.5 656.864 329.5C688.864 371.5 730.864 385.5 770.864 379.5C810.864 373.5 850.864 337.5 810.864 313.5C770.864 289.5 774.864 213 758.864 171Z" fill="#7BC5E8"/>
 </g>
 <g class="morph-shape morph-edge" filter="url(#filter2_g_1044_19)">
-<path d="M1269.86 135C1317.86 121 1368.36 101 1400.36 149V277.5C1400.36 348 1336.36 323.5 1307.86 331.5C1279.36 339.5 1237.86 339.5 1191.86 309.5C1145.86 279.5 1195.86 259.5 1205.86 235C1215.86 210.5 1221.86 149 1269.86 135Z" fill="#C4E2F5"/>
+<path d="M1269.86 135C1317.86 121 1368.36 101 1400.36 149V277.5C1400.36 348 1336.36 323.5 1307.86 331.5C1279.36 339.5 1237.86 339.5 1191.86 309.5C1145.86 279.5 1195.86 259.5 1205.86 235C1215.86 210.5 1221.86 149 1269.86 135Z" fill="#7BC5E8"/>
 </g>
 <g class="morph-shape morph-center" filter="url(#filter3_g_1044_19)">
-<path d="M824.864 570C774.364 588 770.864 626 712.864 672C684.311 698 740.864 792.5 758.864 794.5C776.864 796.5 852.864 748.5 852.864 724C852.864 699.5 873.364 688 905.364 672C937.364 656 943.364 614 935.364 570C927.364 526 875.364 552 824.864 570Z" fill="#C4E2F5"/>
+<path d="M824.864 570C774.364 588 770.864 626 712.864 672C684.311 698 740.864 792.5 758.864 794.5C776.864 796.5 852.864 748.5 852.864 724C852.864 699.5 873.364 688 905.364 672C937.364 656 943.364 614 935.364 570C927.364 526 875.364 552 824.864 570Z" fill="#7BC5E8"/>
 </g>
 <g class="morph-shape morph-edge" filter="url(#filter4_g_1044_19)">
-<path d="M1454.36 746.5C1388.36 756.5 1394.36 768.5 1378.36 828.5C1353.53 838.5 1300.26 868.9 1285.86 910.5C1267.86 962.5 1275.86 993 1378.36 979C1480.86 965 1466.36 997 1542.36 993C1618.36 989 1618.86 900.5 1576.86 880.5C1534.86 860.5 1550.36 828.5 1542.36 806.5C1534.36 784.5 1520.36 736.5 1454.36 746.5Z" fill="#C4E2F5"/>
+<path d="M1454.36 746.5C1388.36 756.5 1394.36 768.5 1378.36 828.5C1353.53 838.5 1300.26 868.9 1285.86 910.5C1267.86 962.5 1275.86 993 1378.36 979C1480.86 965 1466.36 997 1542.36 993C1618.36 989 1618.86 900.5 1576.86 880.5C1534.86 860.5 1550.36 828.5 1542.36 806.5C1534.36 784.5 1520.36 736.5 1454.36 746.5Z" fill="#7BC5E8"/>
 </g>
 <g class="morph-shape morph-center" filter="url(#filter5_g_1044_19)">
-<ellipse cx="1229.86" cy="620" rx="40" ry="110" transform="rotate(51.8086 1229.86 620)" fill="#C4E2F5"/>
+<ellipse cx="1229.86" cy="620" rx="40" ry="110" transform="rotate(51.8086 1229.86 620)" fill="#7BC5E8"/>
 </g>
 <g class="morph-shape morph-edge" filter="url(#filter6_g_1044_19)">
-<path d="M267.864 562C203.864 536 219.864 566 171.864 660C137.864 682 157.864 720 191.864 736.5C225.864 753 209.864 740.5 205.864 814.5C201.864 888.5 291.864 870.5 343.864 864.5C395.864 858.5 438.364 820.5 412.364 766.5C386.364 712.5 365.864 708 357.864 688C349.864 668 331.864 588 267.864 562Z" fill="#C4E2F5"/>
+<path d="M267.864 562C203.864 536 219.864 566 171.864 660C137.864 682 157.864 720 191.864 736.5C225.864 753 209.864 740.5 205.864 814.5C201.864 888.5 291.864 870.5 343.864 864.5C395.864 858.5 438.364 820.5 412.364 766.5C386.364 712.5 365.864 708 357.864 688C349.864 668 331.864 588 267.864 562Z" fill="#7BC5E8"/>
 </g>
 <g class="morph-shape morph-center" filter="url(#filter7_g_1044_19)">
-<path d="M796.864 898.5C750.864 910.5 762.864 834.5 716.864 882.5C711.531 857.833 674.864 877.7 658.864 898.5C638.864 924.5 564.364 946.5 540.364 1007C516.364 1067.5 570.364 1017 678.864 1007C787.364 997 754.864 1017 828.864 1017C902.864 1017 885.364 1005 891.364 946.5C897.364 888 842.864 886.5 796.864 898.5Z" fill="#C4E2F5"/>
+<path d="M796.864 898.5C750.864 910.5 762.864 834.5 716.864 882.5C711.531 857.833 674.864 877.7 658.864 898.5C638.864 924.5 564.364 946.5 540.364 1007C516.364 1067.5 570.364 1017 678.864 1007C787.364 997 754.864 1017 828.864 1017C902.864 1017 885.364 1005 891.364 946.5C897.364 888 842.864 886.5 796.864 898.5Z" fill="#7BC5E8"/>
 </g>
 </g>
 <defs>
@@ -772,8 +678,6 @@
 </defs>
 </svg>
 
-<!-- WAVE OVERLAY: sweeps top-right -> bottom-left. wave-a always renders;
-     wave-b/wave-c are dropped in perf-lite mode (see CSS above). -->
 <div class="wave-stage">
   <svg class="wave-svg" viewBox="0 0 1920 1080" preserveAspectRatio="xMidYMid slice" xmlns="http://www.w3.org/2000/svg">
     <defs>
@@ -801,7 +705,6 @@
       </filter>
     </defs>
 
-    <!-- Wave A: starts immediately at 0s -->
     <g class="wave-mover wave-a" filter="url(#waveTexture)">
       <animateTransform
         attributeName="transform"
@@ -815,7 +718,7 @@
         keyTimes="0; 1"
         values="470 -330; -560 390" />
 
-      <path fill="#C4E2F5">
+      <path fill="#A9DDF3">
         <animate
           attributeName="opacity"
           begin="0s"
@@ -840,7 +743,6 @@
       </path>
     </g>
 
-    <!-- Wave B: starts 2s later (dropped in perf-lite) -->
     <g class="wave-mover wave-b" filter="url(#waveTexture)">
       <animateTransform
         attributeName="transform"
@@ -854,7 +756,7 @@
         keyTimes="0; 1"
         values="470 -330; -560 390" />
 
-      <path fill="#C4E2F5">
+      <path fill="#A9DDF3">
         <animate
           attributeName="opacity"
           begin="2s"
@@ -879,7 +781,6 @@
       </path>
     </g>
 
-    <!-- Wave C: starts 4s later (dropped in perf-lite) -->
     <g class="wave-mover wave-c" filter="url(#waveTexture)">
       <animateTransform
         attributeName="transform"
@@ -893,7 +794,7 @@
         keyTimes="0; 1"
         values="470 -330; -560 390" />
 
-      <path fill="#C4E2F5">
+      <path fill="#A9DDF3">
         <animate
           attributeName="opacity"
           begin="4s"
@@ -922,14 +823,6 @@
 <div id="led"></div>
 
 <script>
-  // Corner blobs are barely/never visible on mobile & tablet widths (covered
-  // by the enlarged main blob, or pushed toward edges the viewport doesn't
-  // show). Rather than just hiding them with CSS, fully remove them from the
-  // DOM below 900px — their filters are never created, never painted, and
-  // their SMIL timers never run. Cache each slot's markup so it can be
-  // restored if the window is resized back up past the breakpoint (e.g. a
-  // desktop browser window, or a tablet rotated wide enough — this only
-  // matters for live window resizing, not a one-time page load).
   (function () {
     var slots = Array.prototype.slice.call(document.querySelectorAll('.corner-slot'));
     var cache = slots.map(function (slot) { return slot.innerHTML; });
@@ -950,19 +843,6 @@
 </script>
 
 <script>
-  // Detect small viewport OR weak-but-wide hardware (budget tablets, older
-  // laptops) and drop to the lighter effect set. No more 10,000-div loop here.
-  //
-  // Beyond the CSS toggles (handled by html.perf-lite, already applied
-  // before paint by the head script), this also:
-  //  - removes the .morph-edge groups from the DOM entirely (not just
-  //    display:none), so their SMIL turbulence timers stop ticking
-  //  - strips the baseFrequency <animate> from the main blob and the 4
-  //    morph-center filters, freezing them at their static fallback value
-  //    (already set as a `baseFrequency` attribute on each <feTurbulence>)
-  //  - drops the main blob's numOctaves 3 -> 2
-  // All of this is cached and restored if the device leaves perf-lite
-  // (e.g. rotating a tablet to a wider orientation).
   (function () {
     var freezeTargets = [
       '#filter0_g_1041_5 feTurbulence',
@@ -1005,13 +885,6 @@
 
     var mainBlobTurb = document.querySelector('#filter0_g_1041_5 feTurbulence');
 
-    // ---- Main blob speed on mobile ----
-    // All four of the main blob's animations (viewBox, path d, turbulence
-    // baseFrequency, displacement scale) share dur="6s" and are keyframed
-    // together — slow one down without the others and the morph looks like
-    // it's sliding instead of breathing. Change MOBILE_BLOB_DUR below to
-    // tune it (e.g. '9s' = 50% slower, '4s' = 50% faster). Leave it equal
-    // to '6s' to match desktop.
     var MOBILE_BLOB_DUR = '9s';
     var mainBlobAnims = Array.prototype.slice.call(document.querySelectorAll('svg.main-blob animate'));
     var mainBlobOriginalDurs = mainBlobAnims.map(function (a) { return a.getAttribute('dur'); });
@@ -1048,8 +921,6 @@
 </script>
 
 <script>
-  // Respect the user's reduced-motion preference by freezing every SMIL
-  // animation on every <svg> on the page.
   (function () {
     var query = window.matchMedia('(prefers-reduced-motion: reduce)');
     function applyMotionPreference(reduce) {
