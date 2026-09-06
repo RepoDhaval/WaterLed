@@ -4,6 +4,23 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>Blob Morph + Wave Sweep (Optimized)</title>
+
+<!--
+  Runs synchronously, before the body (and its heavy SVG filters) is even
+  parsed, so `html.perf-lite` is already set by the time those elements
+  render. Without this, the page briefly paints the full-cost version and
+  then strips it back a frame or two later.
+-->
+<script>
+(function () {
+  var coarse = (navigator.hardwareConcurrency && navigator.hardwareConcurrency <= 4) ||
+               (navigator.deviceMemory && navigator.deviceMemory <= 4);
+  if (window.matchMedia('(max-width: 768px)').matches || coarse) {
+    document.documentElement.classList.add('perf-lite');
+  }
+}());
+</script>
+
 <style>
 
   /*
@@ -30,6 +47,23 @@
        painted, and their SMIL timers never tick. A CSS `display:none`
        fallback at the same breakpoint covers no-JS environments (it won't
        free the animation cost, but it stops the paint cost).
+    7. FROZEN TURBULENCE (the big one). Two filter pipelines animate
+       `baseFrequency` on their <feTurbulence>: the main blob, and the 4
+       "morph-center" background blobs. Animating baseFrequency forces the
+       browser to fully regenerate the noise texture every frame — it's the
+       single most expensive operation on this page, independent of shape
+       size. The morph-center blobs never move otherwise (their `d` is
+       static), so in perf-lite their baseFrequency animation is removed
+       entirely and replaced with a static mid-cycle value: the filter
+       becomes fully static and is effectively free after first paint, with
+       ~no visible difference (it was a slow, subtle 40s wobble). The main
+       blob's shape keeps morphing either way, so its turbulence can't be
+       made fully static, but freezing baseFrequency still lets the browser
+       reuse the generated noise texture across frames instead of
+       resynthesizing it, which is the majority of that filter's cost.
+    8. perf-lite is now applied to `html` (not `body`) via a synchronous
+       head script, so the CSS-driven parts of perf-lite (hidden layers,
+       blend mode swap) apply before first paint instead of after.
   */
 
   :root {
@@ -177,22 +211,53 @@
     }
   }
 
-  /* ---- perf-lite: applied by JS on small viewports OR weak hardware ---- */
+  /* ---- perf-lite: applied to <html> by the head script (before paint) and
+     kept in sync by the bottom script (resize / orientation change). ---- */
 
   /* Morph shapes near the edges of the 1705x1080 viewBox get cropped out by
      `preserveAspectRatio="xMidYMid slice"` on narrow/tall viewports anyway —
-     hiding them here is a pure perf win with ~no visual change. */
-  body.perf-lite .morph-edge { display: none; }
+     hiding them here is a pure perf win with ~no visual change. JS also
+     removes them from the DOM entirely (see bottom script). */
+  html.perf-lite .morph-edge { display: none; }
 
   /* Cut 3 concurrent wave sweeps down to 1. */
-  body.perf-lite .wave-b,
-  body.perf-lite .wave-c { display: none; }
+  html.perf-lite .wave-b,
+  html.perf-lite .wave-c { display: none; }
 
   /* Drop the wave's turbulence/displacement filter (CSS filter overrides the
      SVG presentation attribute) — keeps the smooth path + fade motion,
      removes the priciest part of the effect. Also swap the blend mode. */
-  body.perf-lite .wave-mover { filter: none !important; }
-  body.perf-lite .wave-stage { mix-blend-mode: normal; opacity: .35; }
+  html.perf-lite .wave-mover { filter: none !important; }
+  html.perf-lite .wave-stage { mix-blend-mode: normal; opacity: .35; }
+
+  /* The morph-center blobs' turbulence baseFrequency is frozen by JS in
+     perf-lite (see bottom script) — that's the actual cost saving, since it
+     stops the filter from being recomputed every frame. But a fully static
+     shape looks dead next to everything else that's moving. `transform` and
+     `opacity` are compositor-only properties — animating them costs almost
+     nothing (no repaint, no filter recompute) — so they replace the
+     turbulence wobble as the *visible* motion instead of removing motion
+     altogether. `:nth-of-type` lines up with the fixed edge/center ordering
+     of the .morph-shape siblings (edge, center, edge, center, ...), so no
+     extra class or JS is needed to tell the four center blobs apart. */
+  @keyframes morph-drift-a {
+    0%, 100% { transform: translate(0, 0) scale(1); }
+    50%      { transform: translate(10px, -12px) scale(1.06); }
+  }
+  @keyframes morph-drift-b {
+    0%, 100% { transform: translate(0, 0) scale(1); }
+    50%      { transform: translate(-12px, 9px) scale(0.94); }
+  }
+  html.perf-lite .morph-center {
+    transform-box: fill-box;
+    transform-origin: center;
+    animation: morph-drift-a 9s ease-in-out infinite;
+  }
+  html.perf-lite .morph-center:nth-of-type(4n) {
+    animation-name: morph-drift-b;
+    animation-duration: 11s;
+    animation-delay: -4s; /* desyncs it from the odd-position blobs */
+  }
 
 </style>
 </head>
@@ -231,7 +296,7 @@
     <filter id="filter0_g_1041_5" x="-0.000198364" y="4.57764e-05" width="716.145" height="779.878" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
       <feFlood flood-opacity="0" result="BackgroundImageFix"/>
       <feBlend mode="normal" in="SourceGraphic" in2="BackgroundImageFix" result="shape"/>
-      <feTurbulence type="fractalNoise" numOctaves="3" seed="6522" result="noise">
+      <feTurbulence type="fractalNoise" numOctaves="3" seed="6522" baseFrequency="0.0156" result="noise">
         <animate
           attributeName="baseFrequency"
           dur="6s"
@@ -501,8 +566,13 @@
 
 <!-- Scattered morph field. Shapes tagged "morph-edge" sit near the horizontal
      edges of the 1705-wide viewBox and get cropped off by the
-     "xMidYMid slice" fit on narrow/tall viewports — hidden in perf-lite mode
-     with effectively no visual loss, for a real filter-count saving. -->
+     "xMidYMid slice" fit on narrow/tall viewports — hidden AND removed from
+     the DOM in perf-lite mode with effectively no visual loss.
+     Shapes tagged "morph-center" never move (their `d` is static) — only
+     their turbulence baseFrequency animates, purely for a subtle 40s
+     wobble. In perf-lite that animation is removed by JS below and a
+     static baseFrequency attribute (already on each <feTurbulence> here)
+     takes over, making the whole filter static and effectively free. -->
 <svg class="morph-layer" viewBox="0 0 1705 1080" preserveAspectRatio="xMidYMid slice" fill="none" xmlns="http://www.w3.org/2000/svg">
 <g opacity="0.64">
 <g class="morph-shape morph-edge" filter="url(#filter0_g_1044_19)">
@@ -555,7 +625,7 @@
 <filter id="filter1_g_1044_19" x="502.767" y="50.7498" width="424.666" height="430.074" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
 <feFlood flood-opacity="0" result="BackgroundImageFix"/>
 <feBlend mode="normal" in="SourceGraphic" in2="BackgroundImageFix" result="shape"/>
-<feTurbulence type="fractalNoise" numOctaves="2" seed="3800">
+<feTurbulence type="fractalNoise" numOctaves="2" seed="3800" baseFrequency="0.02964">
 <animate
   attributeName="baseFrequency"
   dur="40s"
@@ -597,7 +667,7 @@
 <filter id="filter3_g_1044_19" x="604.952" y="445.803" width="433.602" height="448.757" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
 <feFlood flood-opacity="0" result="BackgroundImageFix"/>
 <feBlend mode="normal" in="SourceGraphic" in2="BackgroundImageFix" result="shape"/>
-<feTurbulence type="fractalNoise" numOctaves="2" seed="3800">
+<feTurbulence type="fractalNoise" numOctaves="2" seed="3800" baseFrequency="0.02794">
 <animate
   attributeName="baseFrequency"
   dur="40s"
@@ -639,7 +709,7 @@
 <filter id="filter5_g_1044_19" x="1039.92" y="445.055" width="379.891" height="349.889" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
 <feFlood flood-opacity="0" result="BackgroundImageFix"/>
 <feBlend mode="normal" in="SourceGraphic" in2="BackgroundImageFix" result="shape"/>
-<feTurbulence type="fractalNoise" numOctaves="2" seed="3800">
+<feTurbulence type="fractalNoise" numOctaves="2" seed="3800" baseFrequency="0.03465">
 <animate
   attributeName="baseFrequency"
   dur="40s"
@@ -681,7 +751,7 @@
 <filter id="filter7_g_1044_19" x="434.737" y="766.432" width="557.082" height="369.82" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
 <feFlood flood-opacity="0" result="BackgroundImageFix"/>
 <feBlend mode="normal" in="SourceGraphic" in2="BackgroundImageFix" result="shape"/>
-<feTurbulence type="fractalNoise" numOctaves="2" seed="3800">
+<feTurbulence type="fractalNoise" numOctaves="2" seed="3800" baseFrequency="0.03212">
 <animate
   attributeName="baseFrequency"
   dur="40s"
@@ -882,21 +952,98 @@
 <script>
   // Detect small viewport OR weak-but-wide hardware (budget tablets, older
   // laptops) and drop to the lighter effect set. No more 10,000-div loop here.
+  //
+  // Beyond the CSS toggles (handled by html.perf-lite, already applied
+  // before paint by the head script), this also:
+  //  - removes the .morph-edge groups from the DOM entirely (not just
+  //    display:none), so their SMIL turbulence timers stop ticking
+  //  - strips the baseFrequency <animate> from the main blob and the 4
+  //    morph-center filters, freezing them at their static fallback value
+  //    (already set as a `baseFrequency` attribute on each <feTurbulence>)
+  //  - drops the main blob's numOctaves 3 -> 2
+  // All of this is cached and restored if the device leaves perf-lite
+  // (e.g. rotating a tablet to a wider orientation).
   (function () {
+    var freezeTargets = [
+      '#filter0_g_1041_5 feTurbulence',
+      '#filter1_g_1044_19 feTurbulence',
+      '#filter3_g_1044_19 feTurbulence',
+      '#filter5_g_1044_19 feTurbulence',
+      '#filter7_g_1044_19 feTurbulence'
+    ];
+    var frozen = [];
+
+    function freezeTurbulence() {
+      if (frozen.length) return;
+      freezeTargets.forEach(function (sel) {
+        var turb = document.querySelector(sel);
+        if (!turb) return;
+        var anim = turb.querySelector('animate[attributeName="baseFrequency"]');
+        if (anim) {
+          frozen.push({ turb: turb, anim: anim });
+          anim.remove();
+        }
+      });
+    }
+    function unfreezeTurbulence() {
+      frozen.forEach(function (entry) { entry.turb.appendChild(entry.anim); });
+      frozen = [];
+    }
+
+    var morphEdgeCache = [];
+    function removeMorphEdges() {
+      if (morphEdgeCache.length) return;
+      Array.prototype.slice.call(document.querySelectorAll('.morph-edge')).forEach(function (el) {
+        morphEdgeCache.push({ parent: el.parentNode, next: el.nextSibling, el: el });
+        el.remove();
+      });
+    }
+    function restoreMorphEdges() {
+      morphEdgeCache.forEach(function (entry) { entry.parent.insertBefore(entry.el, entry.next); });
+      morphEdgeCache = [];
+    }
+
+    var mainBlobTurb = document.querySelector('#filter0_g_1041_5 feTurbulence');
+
+    // ---- Main blob speed on mobile ----
+    // All four of the main blob's animations (viewBox, path d, turbulence
+    // baseFrequency, displacement scale) share dur="6s" and are keyframed
+    // together — slow one down without the others and the morph looks like
+    // it's sliding instead of breathing. Change MOBILE_BLOB_DUR below to
+    // tune it (e.g. '9s' = 50% slower, '4s' = 50% faster). Leave it equal
+    // to '6s' to match desktop.
+    var MOBILE_BLOB_DUR = '9s';
+    var mainBlobAnims = Array.prototype.slice.call(document.querySelectorAll('svg.main-blob animate'));
+    var mainBlobOriginalDurs = mainBlobAnims.map(function (a) { return a.getAttribute('dur'); });
+
+    function setMainBlobSpeed(mobile) {
+      mainBlobAnims.forEach(function (a, i) {
+        a.setAttribute('dur', mobile ? MOBILE_BLOB_DUR : mainBlobOriginalDurs[i]);
+      });
+    }
+
     var coarseHardware =
       (navigator.hardwareConcurrency && navigator.hardwareConcurrency <= 4) ||
       (navigator.deviceMemory && navigator.deviceMemory <= 4);
-    var smallViewport = window.matchMedia('(max-width: 768px)').matches;
+    var vpQuery = window.matchMedia('(max-width: 768px)');
 
     function applyPerfMode() {
-      var lite = smallViewport || coarseHardware;
-      document.body.classList.toggle('perf-lite', lite);
+      var lite = vpQuery.matches || coarseHardware;
+      document.documentElement.classList.toggle('perf-lite', lite);
+      if (lite) {
+        freezeTurbulence();
+        removeMorphEdges();
+        if (mainBlobTurb) mainBlobTurb.setAttribute('numOctaves', '2');
+        setMainBlobSpeed(true);
+      } else {
+        unfreezeTurbulence();
+        restoreMorphEdges();
+        if (mainBlobTurb) mainBlobTurb.setAttribute('numOctaves', '3');
+        setMainBlobSpeed(false);
+      }
     }
     applyPerfMode();
-    window.matchMedia('(max-width: 768px)').addEventListener('change', function (e) {
-      smallViewport = e.matches;
-      applyPerfMode();
-    });
+    vpQuery.addEventListener('change', applyPerfMode);
   })();
 </script>
 
